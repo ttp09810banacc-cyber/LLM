@@ -181,19 +181,17 @@ class BigramLanguageModel(nn.Module):
 model = BigramLanguageModel()
 m = model.to(device)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+model.load_state_dict(torch.load('model_weights.pth', map_location=device))
+model.eval() # Chuyển sang chế độ dự đoán (tắt Dropout)
 
-for iter in range(max_iters):
-    if iter % eval_interval == 0:
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+print("Đã tải mô hình thành công! Bắt đầu tạo văn bản...")
 
-    xb, yb = get_batch('train')
-
-    logits, loss = model(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
-
+out_file = "generated_shakespeare.txt"
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
-print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
+generated_ids = model.generate(context, max_new_tokens=2000)[0].tolist()
+decoded_text = decode(generated_ids)
+
+with open(out_file, "w", encoding="utf-8") as f:
+    f.write(decoded_text)
+
+print(f"Đã xuất văn bản ra file {out_file} thành công!")

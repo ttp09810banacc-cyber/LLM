@@ -168,11 +168,22 @@ class BigramLanguageModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:]
             logits, loss = self(idx_cond)
             logits = logits[:, -1, :] 
+            
+            logits = logits / temperature
+            
+            if top_k is not None:
+                # torch.topk: iá trị (values) và chỉ số (indices) của $K$ phần tử lớn nhất
+                # logits.size(-1) là tổng số từ trong từ điển. Dùng min phòng trường hợp top_k > tổng số từ 
+                # nếu K=3, v có thể là [10.5, 8.2, 5.0].
+                #   --> v[:, [-1]] chọn từ đầu --> 5.0 --> là ngưỡng cửa
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
             probs = F.softmax(logits, dim=-1) 
             idx_next = torch.multinomial(probs, num_samples=1) 
             idx = torch.cat((idx, idx_next), dim=1) 
