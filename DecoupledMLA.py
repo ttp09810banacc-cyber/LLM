@@ -12,6 +12,8 @@ from tqdm import tqdm
 
 import math
 
+from dataclasses import dataclass
+
 batch_size = 32     # số lượng dữ liệu sử dụng cùng lúc 
 block_size = 512     # độ dài ngữ cảnh 
 max_iters = 10000    # số lần lặp huấn luyện 
@@ -29,6 +31,20 @@ lr_decay_iters = 10000 # Giảm dần về cuối
 min_lr = 2e-5        # LR thấp nhất khi kết thúc (1/10 LR gốc)
 
 # nn.Linear(độ dài vector, kích thước đầu ra, bias=True)
+
+@dataclass
+class ModelConfig:
+    block_size: int = 512
+    vocab_size: int = 50257
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 384
+    dropout: float = 0.1
+    kv_lora_rank: int = 64
+    q_lora_rank: int = 64
+    rope_dim: int = 32
+
+config = ModelConfig()
 
 # tạo seed --> đồng nhất 
 torch.manual_seed(1337)
@@ -99,47 +115,64 @@ def estimate_loss():
     model.train()
     return out
 
-def apply_rope(x, cos, sin):
-    # x: [batch_size, seq_len, n_heads, head_size]
-    # cos, sin: [1, seq_len, 1, head_size]
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    # dim ở đây chính là qk_rope_head_dim (ví dụ: 32)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end)
+    freqs = torch.outer(t, freqs).float() # [end, dim/2]
     
-    # Chia vector thành 2 nửa: [x1, x2, x3, x4] -> [x1, x2], [x3, x4]
+    # Quan trọng: Lặp lại mỗi cột 2 lần để từ dim/2 thành dim (16 -> 32)
+    # Kết quả: [cos1, cos1, cos2, cos2, ...]
+    freqs_cos = torch.cos(freqs).repeat_interleave(2, dim=-1)
+    freqs_sin = torch.sin(freqs).repeat_interleave(2, dim=-1)
+    
+    return freqs_cos, freqs_sin
+
+def apply_rope(x, freqs_cos, freqs_sin):
+    # Lấy shape: [B, T, n_head, rope_dim]
     x1 = x[..., :x.shape[-1] // 2]
     x2 = x[..., x.shape[-1] // 2:]
     
-    # Công thức xoay: [x1*cos - x2*sin, x1*sin + x2*cos]
     rotated_x = torch.cat((-x2, x1), dim=-1)
-    return x * cos + rotated_x * sin
+    return x * freqs_cos + rotated_x * freqs_sin
+
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
+    # Chuyển đổi x sang số phức
+    x_complex = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+    # Đảm bảo freqs_cis có cùng kích thước để broadcast
+    shape = [1] * len(x.shape[:-1])
+    shape[1] = x.shape[1] # Thường là chiều T (sequence length)
+    freqs_cis = freqs_cis.view(*shape)
+    # Phép nhân số phức chính là phép xoay vector
+    x_out = torch.view_as_real(x_complex * freqs_cis).flatten(3)
+    return x_out.type_as(x)
 
 class MLALayer(nn.Module):
     tril: torch.Tensor
-    def __init__(self, n_embd, n_head, head_size, kv_lora_rank, q_lora_rank, rope_dim):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.n_head = n_head
-        self.head_size = head_size
-        self.rope_dim = rope_dim
+        self.n_head = config.n_head
+        self.head_size = config.n_embd // config.n_head
+        self.rope_dim = config.rope_dim
         
-        self.kv_down_proj = nn.Linear(n_embd, kv_lora_rank, bias=False)
-        self.kv_up_proj = nn.Linear(kv_lora_rank, n_head * head_size, bias=False)
+        self.kv_down_proj = nn.Linear(config.n_embd, config.kv_lora_rank, bias=False)
+        self.kv_up_proj = nn.Linear(config.kv_lora_rank, self.n_head * self.head_size, bias=False)
         # Phần của Key: Mỗi đầu chú ý có kích thước là head_size. Với n_head đầu, tổng số chiều cần thiết cho Key là n_head * head_size
         # tương tự vs Value nên 2 lần --> công thức
-        
-        self.k_rope_proj = nn.Linear(kv_lora_rank, n_head*rope_dim, bias=False)
+        self.k_rope_proj = nn.Linear(config.kv_lora_rank, self.n_head * self.rope_dim, bias=False)
         
         self.q_rope_dim = 64
-        self.q_down_proj = nn.Linear(n_embd, q_lora_rank, bias=False)
-        self.q_up_proj = nn.Linear(q_lora_rank, n_head * head_size, bias=False)
-        self.q_rope_proj = nn.Linear(q_lora_rank, n_head * rope_dim, bias=False)
+        self.q_down_proj = nn.Linear(config.n_embd, config.q_lora_rank, bias=False)
+        self.q_up_proj = nn.Linear(config.q_lora_rank, self.n_head * self.head_size, bias=False)
+        self.q_rope_proj = nn.Linear(config.q_lora_rank, self.n_head * self.rope_dim, bias=False)
         
-        self.out_proj = nn.Linear(n_head * head_size, n_embd, bias=False)
+        self.out_proj = nn.Linear(self.n_head * self.head_size, config.n_embd, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
         
-        self.dropout = nn.Dropout(dropout)
+        self.register_buffer('tril', torch.tril(torch.ones(config.block_size, config.block_size)))
         
-        self.register_buffer('tril', torch.tril(torch.ones(block_size,block_size)))
-        
-    def forward(self, x, freqs_cis):
+    def forward(self, x, freqs_cos, freqs_sin):
         B,T,C = x.shape
-        cos, sin = freqs_cis
         
         latent_kv = self.kv_down_proj(x)
         
@@ -151,8 +184,8 @@ class MLALayer(nn.Module):
         q_content = self.q_up_proj(latent_q).view(B, T, self.n_head, self.head_size).transpose(1, 2)
         q_rope = self.q_rope_proj(latent_q).view(B, T, self.n_head, self.rope_dim).transpose(1, 2)
         
-        q_rope = apply_rope(q_rope, cos, sin)
-        k_rope = apply_rope(k_rope, cos, sin)
+        q_rope = apply_rope(q_rope.transpose(1,2), freqs_cos, freqs_sin).transpose(1,2)
+        k_rope = apply_rope(k_rope.transpose(1,2), freqs_cos, freqs_sin).transpose(1,2)
         
         q = torch.cat([q_content, q_rope], dim=-1) # [B, n_head, T, head_size + rope_dim]
         k = torch.cat([k_content, k_rope], dim=-1)
@@ -168,36 +201,35 @@ class MLALayer(nn.Module):
         return self.out_proj(y)
     
 class FeedForwardSwiGLU(nn.Module):
-    def __init__(self, n_embd):
+    def __init__(self, config: ModelConfig):
         super().__init__()
         hidden_dim = int(2/3 * 4 * n_embd)
         
-        self.w1 = nn.Linear(n_embd, hidden_dim, bias=False) # Cổng (Gate)
-        self.w2 = nn.Linear(n_embd, hidden_dim, bias=False) # Giá trị (Value)
-        self.w3 = nn.Linear(hidden_dim, n_embd, bias=False) # Lớp chiếu ngược lại
+        self.w1 = nn.Linear(config.n_embd, hidden_dim, bias=False) # Cổng (Gate)
+        self.w2 = nn.Linear(config.n_embd, hidden_dim, bias=False) # Giá trị (Value)
+        self.w3 = nn.Linear(hidden_dim, config.n_embd, bias=False) # Lớp chiếu ngược lại
         
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = nn.Dropout(config.dropout)
     
     def forward(self, x):
         #Công thức: SwiGLU(x) = (SiLU(xW1) * xW2)W3
         gate = self.w1(x)
         value = self.w2(x)
-        x = F.silu(gate) * value
-        return self.dropout(self.w3(x))
+        
+        return self.dropout(self.w3(F.silu(gate) * value))
  
 class Block(nn.Module):
-    def __init__(self, n_embd, n_head, kv_lora_rank):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MLALayer(n_embd, n_head, head_size, kv_lora_rank, q_lora_rank=64, rope_dim=32)
-        self.ffwd = FeedForwardSwiGLU(n_embd)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+        self.sa = MLALayer(config)
+        self.ffwd = FeedForwardSwiGLU(config)
+        self.ln1 = nn.LayerNorm(config.n_embd)
+        self.ln2 = nn.LayerNorm(config.n_embd)
         
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, freqs_cos, freqs_sin):
+        x = x + self.sa(self.ln1(x), freqs_cos, freqs_sin)
         x = x + self.ffwd(self.ln2(x))
-        return x 
+        return x
          
 
 ### B - Batch size: số văn bản được đưa vào = batch_size
@@ -205,38 +237,61 @@ class Block(nn.Module):
 ### C - Channel / Embedding Dimension: độ dài của vector đại diện cho mỗi token = n_embd
 
 
-class BigramLanguageModel(nn.Module):
+class GPTLanguageModel(nn.Module):
     # hàm khởi tạo
-    def __init__(self):
+    def __init__(self, config: ModelConfig):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)   # tạo 1 bảng 2 chiều (ma trận) vs số hàng và cột để khi gọi sẽ tả cứu
+        self.config = config
+        self.token_embedding_table = nn.Embedding(config.vocab_size, config.n_embd)   # tạo 1 bảng 2 chiều (ma trận) vs số hàng và cột để khi gọi sẽ tả cứu
+        
         # block_size là vị trí tokens, và vect vtrí khớp vs vect từ 
-        self.pos_embedding_table = nn.Embedding(block_size, n_embd) #block_size: Số lượng vị trí tối đa mà mô hình có thể xử lý
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head = n_head,kv_lora_rank=kv_lora_rank) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size,bias=False)
+        
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         self.lm_head.weight = self.token_embedding_table.weight
         self.apply(self._init_weights)
         
+        freqs_cos, freqs_sin = precompute_freqs_cis(config.rope_dim, config.block_size)
+        self.register_buffer("freqs_cos", freqs_cos.unsqueeze(0).unsqueeze(2)) # [1, T, 1, rope_dim/2]
+        self.register_buffer("freqs_sin", freqs_sin.unsqueeze(0).unsqueeze(2))
+        
+        cos, sin = precompute_freqs_cis(config.rope_dim, config.block_size)
+        self.register_buffer("freqs_cos", cos.view(1, config.block_size, 1, -1)) 
+        self.register_buffer("freqs_sin", sin.view(1, config.block_size, 1, -1))
+        
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)        
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)     
     
     def forward(self, idx, targets=None):
-        B,T = idx.shape
+        # Lấy thông tin kích thước và device trực tiếp từ tensor đầu vào
+        B, T = idx.shape
 
-        tok_emd = self.token_embedding_table(idx)   # tra cứu
-        pos_emb = self.pos_embedding_table(torch.arange(T, device=device)) #Tạo ra một dãy số nguyên từ 0 đến T-1   "chỉ số vị trí" của các từ hiện tại trong chuỗi.
-        #   Kết quả pos_emb có kích thước là (T, C)
-        x = tok_emd + pos_emb
-        x = self.blocks(x)
+        # 1. Embedding (Bỏ pos_emb vì đã có RoPE bên trong MLA)
+        x = self.token_embedding_table(idx) # (B, T, n_embd)
+
+        assert isinstance(self.freqs_cos, torch.Tensor)
+        assert isinstance(self.freqs_sin, torch.Tensor)
+        
+        f_cos = self.freqs_cos[:, :T, :, :] 
+        f_sin = self.freqs_sin[:, :T, :, :]
+        
+        for block in self.blocks:
+            x = block(x, f_cos, f_sin)
+
+        # 3. Truyền qua các Blocks
+        # LƯU Ý: Nếu self.blocks là nn.Sequential, bạn KHÔNG THỂ gọi self.blocks(x, freqs_cis)
+        # Bạn phải dùng vòng lặp for để truyền tham số bổ sung
+        for block in self.blocks:
+            x = block(x, f_cos, f_sin)
+
         x = self.ln_f(x)
-        logits = self.lm_head(x)  # chiêu lên lớp tuyến tính 
+        logits = self.lm_head(x)
 
-        if targets is None:
-            loss = None
-        else:
+        loss = None
+        if targets is not None:
             B, T, C = logits.shape
             logits = logits.view(B*T, C)
             targets = targets.view(B*T)
@@ -251,7 +306,7 @@ class BigramLanguageModel(nn.Module):
             logits = logits[:, -1, :] 
             
             logits = logits / temperature
-            
+
             if top_k is not None:
                 # torch.topk: iá trị (values) và chỉ số (indices) của $K$ phần tử lớn nhất
                 # logits.size(-1) là tổng số từ trong từ điển. Dùng min phòng trường hợp top_k > tổng số từ 
@@ -265,7 +320,7 @@ class BigramLanguageModel(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1) 
         return idx
 
-model = BigramLanguageModel()
+model = GPTLanguageModel(config=config)
 m = model.to(device)
 
 optimizer = torch.optim.AdamW(
