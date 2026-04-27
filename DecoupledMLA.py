@@ -5,6 +5,7 @@ import numpy as np
 import torch 
 import torch.nn as nn 
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from datasets import load_dataset
 import tiktoken
@@ -195,7 +196,14 @@ class MLALayer(nn.Module):
         att = F.softmax(att, dim=-1)
         att = self.dropout(att) 
         
-        y = att @ v
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            # Truyền con số float (0.1 hoặc 0.2), không truyền nn.Module
+            dropout_p=self.config.dropout if self.training else 0.0,     # type:ignore
+            is_causal=True 
+        )
+
         y = y.transpose(1, 2).contiguous().view(B, T, self.n_head * self.head_size) # chuyển lại về dạng vector chuẩn để tính toán sau 
         
         return self.out_proj(y)
@@ -285,7 +293,7 @@ class GPTLanguageModel(nn.Module):
         # LƯU Ý: Nếu self.blocks là nn.Sequential, bạn KHÔNG THỂ gọi self.blocks(x, freqs_cis)
         # Bạn phải dùng vòng lặp for để truyền tham số bổ sung
         for block in self.blocks:
-            x = block(x, f_cos, f_sin)
+            x = checkpoint(block, x, f_cos, f_sin, use_reentrant=False)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
