@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 model_weights.pth
 path/
+train.bin
+val.bin
