@@ -13,7 +13,7 @@ from tqdm import tqdm
 import math
 
 batch_size = 32     # số lượng dữ liệu sử dụng cùng lúc 
-block_size = 256     # độ dài ngữ cảnh 
+block_size = 512     # độ dài ngữ cảnh 
 max_iters = 10000    # số lần lặp huấn luyện 
 eval_interval = 500    # khoảng cách các lần kiểm tra để xem kết quả
 learning_rate = 2e-4    # tốc độ học
@@ -22,7 +22,7 @@ eval_iters = 200    # số lần kiểm tra
 n_embd = 384 # số chiều vector
 n_head = 8
 n_layer = 8
-dropout = 0.2
+dropout = 0.1
 kv_lora_rank = 64
 warmup_iters = 500   # 500 bước đầu để model làm quen
 lr_decay_iters = 10000 # Giảm dần về cuối
@@ -221,7 +221,7 @@ class BigramLanguageModel(nn.Module):
         
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)        
     
     def forward(self, idx, targets=None):
         B,T = idx.shape
