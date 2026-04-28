@@ -1,26 +1,18 @@
 import torch
 import tiktoken
-from DecoupledMLA import BigramLanguageModel # Giả sử bạn để class model trong file model.py
+from to_test import GPTLanguageModel, ModelConfig 
 
 # --- 1. Cấu hình (Phải khớp với lúc train) ---
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-ckpt_path = 'path/gpt_webtext_step8000.pth' # Đường dẫn file của bạn
+ckpt_path = 'path/latest_weights.pt' # Đường dẫn file của bạn
 
 # --- 2. Khởi tạo Tokenizer và Model ---
 enc = tiktoken.get_encoding("gpt2")
 
+config = ModelConfig()
+
 # Bạn cần khởi tạo lại class model với thông số y hệt lúc train
-model = BigramLanguageModel(
-    vocab_size = enc.n_vocab,
-    n_layer = 8, 
-    n_head = 8, 
-    n_embd = 384,
-    block_size = 512,
-    dropout = 0.1,
-    kv_lora_rank = 64,
-    q_lora_rank=64,
-    rope_dim=32
-)
+model = GPTLanguageModel(config = config)
 
 # --- 3. Load trọng số từ file .pth ---
 checkpoint = torch.load(ckpt_path, map_location=device)
