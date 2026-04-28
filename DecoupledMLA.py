@@ -16,7 +16,7 @@ import math
 from dataclasses import dataclass
 
 batch_size = 32     # số lượng dữ liệu sử dụng cùng lúc 
-block_size = 512     # độ dài ngữ cảnh 
+block_size = 256     # độ dài ngữ cảnh 
 max_iters = 10000    # số lần lặp huấn luyện 
 eval_interval = 500    # khoảng cách các lần kiểm tra để xem kết quả
 learning_rate = 2e-4    # tốc độ học
@@ -35,7 +35,7 @@ min_lr = 2e-5        # LR thấp nhất khi kết thúc (1/10 LR gốc)
 
 @dataclass
 class ModelConfig:
-    block_size: int = 512
+    block_size: int = 256
     vocab_size: int = 50257
     n_layer: int = 8
     n_head: int = 8
@@ -152,6 +152,7 @@ class MLALayer(nn.Module):
     tril: torch.Tensor
     def __init__(self, config: ModelConfig):
         super().__init__()
+        self.config = config
         self.n_head = config.n_head
         self.head_size = config.n_embd // config.n_head
         self.rope_dim = config.rope_dim
